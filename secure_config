@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+
+set -ue
+
+: ${SECURE_CONFIG_KEY_ID='alias/default/secure-config'}
+: ${SECURE_CONFIG_KEY_SPEC='AES_256'}
+: ${SECURE_CONFIG_OPENSSL_KEY_SPEC='aes-256-cbc'}
+: ${IV=`openssl rand -hex 16`}
+: ${BUCKET='secure'}
+: ${BUCKET_ENV='nonprod'}
+: ${AWS_DEFAULT_REGION='ap-southeast-2'}
+: ${DEBUG='false'}
+
+export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION
+
+if [ "$DEBUG" = "true" ]; then
+  set -uex
+fi
+
+function echoerr() {
+  if [ "$DEBUG" = "true" ]; then
+    echo -e "$@" 1>&2;
+  fi
+}
+
+function fail {
+  if [ -n "$1" ]; then
+    echo -e "$1" 1>&2;
+  fi
+  exit 1
+}
+
+function generate-key {
+  aws kms generate-data-key \
+    --key-id $SECURE_CONFIG_KEY_ID \
+    --key-spec $SECURE_CONFIG_KEY_SPEC \
+    --output text \
+    --query [Plaintext,CiphertextBlob]
+}
+
+function kms-encrypt {
+  local plaintext=$1
+
+  if [ -n "$plaintext" ]; then
+    aws kms encrypt \
+      --key-id $SECURE_CONFIG_KEY_ID \
+      --plaintext $plaintext \
+      --output text \
+      --query CiphertextBlob
+  fi
+}
+
+function kms-decrypt {
+  local ciphertext=$1
+
+  if [ -n "$ciphertext" ]; then
+    aws kms decrypt \
+      --ciphertext-blob fileb://<(echo "$ciphertext" | openssl enc -base64 -d -A) \
+      --output text \
+      --query [Plaintext]
+  fi
+}
+
+function encrypt {
+  local input=$(cat)
+  local keys=($(generate-key))
+  local key=$(echo -n ${keys[0]} | openssl enc -base64 -d -A | od -t x1 -An | tr -d '\n' | tr -d ' ')
+  local encrypted_key=$(echo -n ${keys[1]})
+  if [ -n "$key" ]; then
+    if [ -n "$encrypted_key" ]; then
+      echoerr "= KEY $key"
+      echoerr "= UNENCRYPTED MESSAGE\n"
+      echoerr -e "$input"
+
+      local data=$(openssl enc -$SECURE_CONFIG_OPENSSL_KEY_SPEC -K $key -nosalt -A -base64 -e -iv $IV -in <(echo "$input"))
+      local serialized="SECURE CONFIG V1|$IV|$encrypted_key|$data"
+
+      echoerr -e "\n= ENCRYPTED\n"
+      echoerr "$serialized"
+
+      echo "$serialized"
+      exit 0
+    fi
+  fi
+  exit 1
+}
+
+function decrypt {
+  local input=$(cat)
+  local header=$(echo "$input" | cut -d '|' -f1 )
+  local iv=$(echo "$input" | cut -d '|' -f2 )
+  local encrypted_key=$(echo "$input" | cut -d '|' -f3 )
+  local ciphertext=$(echo "$input" | cut -d '|' -f4 )
+
+  if [ ! -n "$encrypted_key" ]; then
+    fail "Invalid Encrypted key"
+  fi
+
+  local base64key=$(kms-decrypt $encrypted_key)
+  local key=$(echo $base64key | openssl enc -base64 -d -A | od -t x1 -An | tr -d '\n' | tr -d ' ')
+
+  echoerr -e "\n= KEY $base64key\n"
+  echoerr -e "\n= DECRYPTED\n"
+  echoerr "= KEY $key"
+
+  local raw=$(openssl $SECURE_CONFIG_OPENSSL_KEY_SPEC -K $key -iv $iv -d -in <(echo "$ciphertext" | openssl enc -base64 -d -A))
+  echoerr -e "\n= DECRYPTED MESSAGE\n"
+  echoerr "$raw"
+  echo "$raw"
+}
+
+function fetch-secure-config {
+  if [ ! -n "$BUCKET" ]; then
+    fail "BUCKET is not set"
+  fi
+
+  if [ ! -n "$BUCKET_ENV" ]; then
+    fail "BUCKET_ENV is not set"
+  fi
+
+  if [ ! -n "$APPLICATION" ]; then
+    fail "APPLICATION is not set"
+  fi
+
+  local file=${1:-.env}
+  local s3_endpoint="s3://$BUCKET/$BUCKET_ENV/$APPLICATION/$file"
+
+  echoerr -e "\n= fetching secure config: $file\n"
+  echoerr "= endpoint $s3_endpoint"
+
+  result=$(aws s3 cp $s3_endpoint -)
+  echo "$result"
+}
+
+function push-secure-config {
+  if [ ! -n "$BUCKET" ]; then
+    fail "BUCKET is not set"
+  fi
+
+  if [ ! -n "$BUCKET_ENV" ]; then
+    fail "BUCKET_ENV is not set"
+  fi
+
+  if [ ! -n "$APPLICATION" ]; then
+    fail "APPLICATION is not set"
+  fi
+
+  local file=${1:-.env}
+  local s3_endpoint="s3://$BUCKET/$BUCKET_ENV/$APPLICATION/$file"
+
+  echoerr -e "\n= pushing secure config: $file\n"
+  echoerr "= endpoint $s3_endpoint"
+
+  local input=$(cat)
+  result=$(echo $input | aws s3 cp - $s3_endpoint)
+  echoerr -e "\n= result: $result\n"
+}
+
+function list {
+  if [ ! -n "$BUCKET" ]; then
+    fail "BUCKET is not set"
+  fi
+
+  if [ ! -n "$BUCKET_ENV" ]; then
+    fail "BUCKET_ENV is not set"
+  fi
+
+  if [ ! -n "$APPLICATION" ]; then
+    fail "APPLICATION is not set"
+  fi
+
+  local s3_endpoint="s3://$BUCKET/$BUCKET_ENV/$APPLICATION/"
+
+  echoerr -e "\n= list secure config\n"
+  echoerr "= endpoint $s3_endpoint"
+
+  result=$(aws s3 ls $s3_endpoint)
+  echo "$result"
+}
+
+"$@"
